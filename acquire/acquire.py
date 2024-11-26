@@ -1,34 +1,38 @@
+from __future__ import annotations
+
 import argparse
 import enum
 import functools
 import io
 import itertools
-import json
 import logging
 import os
+import platform
 import shutil
 import subprocess
 import sys
 import time
 import urllib.parse
 import urllib.request
-from collections import defaultdict
+from collections import defaultdict, namedtuple
+from itertools import product
 from pathlib import Path
-from typing import Iterator, Optional, Union
+from typing import BinaryIO, Callable, Iterator, Optional, Union
 
-from dissect.target import Target, exceptions
+from dissect.target import Target
 from dissect.target.filesystem import Filesystem
 from dissect.target.filesystems import ntfs
 from dissect.target.helpers import fsutil
-from dissect.target.loaders.remote import RemoteStreamConnection
-from dissect.target.loaders.targetd import TargetdLoader
+from dissect.target.loaders.local import _windows_get_devices
 from dissect.target.plugins.apps.webserver import iis
 from dissect.target.plugins.os.windows.log import evt, evtx
+from dissect.target.tools.utils import args_to_uri
 from dissect.util.stream import RunlistStream
 
 from acquire.collector import Collector, get_full_formatted_report, get_report_summary
 from acquire.dynamic.windows.named_objects import NamedObjectType
 from acquire.esxi import esxi_memory_context_manager
+from acquire.gui import GUI
 from acquire.hashes import (
     HashFunc,
     collect_hashes,
@@ -89,7 +93,6 @@ MODULE_LOOKUP = {}
 
 CLI_ARGS_MODULE = "cli-args"
 
-
 log = logging.getLogger("acquire")
 log.propagate = 0
 log_file_handler = None
@@ -146,46 +149,48 @@ MISC_MAPPING = {
 def from_user_home(target: Target, path: str) -> Iterator[str]:
     try:
         for user_details in target.user_details.all_with_home():
-            yield normalize_path(target, user_details.home_path.joinpath(path), lower_case=False)
+            yield user_details.home_path.joinpath(path).as_posix()
     except Exception as e:
         log.warning("Error occurred when requesting all user homes")
         log.debug("", exc_info=e)
 
     misc_user_homes = MISC_MAPPING.get(target.os, misc_unix_user_homes)
     for user_dir in misc_user_homes(target):
-        yield str(user_dir.joinpath(path))
+        yield user_dir.joinpath(path).as_posix()
 
 
-def iter_ntfs_filesystems(target: Target) -> Iterator[tuple[ntfs.NtfsFilesystem, str, str]]:
+def iter_ntfs_filesystems(target: Target) -> Iterator[tuple[ntfs.NtfsFilesystem, Optional[str], str, str]]:
     mount_lookup = defaultdict(list)
     for mount, fs in target.fs.mounts.items():
         mount_lookup[fs].append(mount)
 
-    sysvol = target.fs.mounts["sysvol"]
     for fs in target.filesystems:
-        if fs in mount_lookup:
-            mountpoints = ", ".join(mount_lookup[fs])
-        else:
-            mountpoints = "No mounts"
-
         # The attr check is needed to correctly collect fake NTFS filesystems
         # where the MFT etc. are added to a VirtualFilesystem. This happens for
         # instance when the target is an acquired tar target.
         if not isinstance(fs, ntfs.NtfsFilesystem) and not hasattr(fs, "ntfs"):
-            log.warning("Skipping %s (%s) - not an NTFS filesystem", fs, mountpoints)
+            log.warning("Skipping %s - not an NTFS filesystem", fs)
             continue
 
-        if fs == sysvol:
-            name = "sysvol"
-        elif fs in mount_lookup:
-            name = mount_lookup[fs][0]
+        if fs in mount_lookup:
+            mountpoints = mount_lookup[fs]
+
+            for main_mountpoint in mountpoints:
+                if main_mountpoint != "sysvol":
+                    break
+
+            name = main_mountpoint
+            mountpoints = ", ".join(mountpoints)
         else:
+            main_mountpoint = None
             name = f"vol-{fs.ntfs.serial:x}"
+            mountpoints = "No mounts"
+            log.warning("Unmounted NTFS filesystem found %s (%s)", fs, name)
 
-        yield fs, name, mountpoints
+        yield fs, main_mountpoint, name, mountpoints
 
 
-def iter_esxi_filesystems(target: Target) -> Iterator[tuple[str, str, Filesystem]]:
+def iter_esxi_filesystems(target: Target) -> Iterator[tuple[Filesystem, str, str, Optional[str]]]:
     for mount, fs in target.fs.mounts.items():
         if not mount.startswith("/vmfs/volumes/"):
             continue
@@ -197,11 +202,11 @@ def iter_esxi_filesystems(target: Target) -> Iterator[tuple[str, str, Filesystem
         elif fs.__type__ == "vmfs":
             name = fs.vmfs.label
 
-        yield uuid, name, fs
+        yield fs, mount, uuid, name
 
 
-def register_module(*args, **kwargs):
-    def wrapper(module_cls):
+def register_module(*args, **kwargs) -> Callable[[type[Module]], type[Module]]:
+    def wrapper(module_cls: type[Module]) -> type[Module]:
         name = module_cls.__name__
 
         if name in MODULES:
@@ -211,7 +216,7 @@ def register_module(*args, **kwargs):
 
         desc = module_cls.DESC or name
         kwargs["help"] = f"acquire {desc}"
-        kwargs["action"] = "store_true"
+        kwargs["action"] = argparse.BooleanOptionalAction
         kwargs["dest"] = name.lower()
         module_cls.__modname__ = name
 
@@ -225,8 +230,8 @@ def register_module(*args, **kwargs):
     return wrapper
 
 
-def module_arg(*args, **kwargs):
-    def wrapper(module_cls):
+def module_arg(*args, **kwargs) -> Callable[[type[Module]], type[Module]]:
+    def wrapper(module_cls: type[Module]) -> type[Module]:
         if not hasattr(module_cls, "__cli_args__"):
             module_cls.__cli_args__ = []
         module_cls.__cli_args__.append((args, kwargs))
@@ -235,7 +240,7 @@ def module_arg(*args, **kwargs):
     return wrapper
 
 
-def local_module(cls):
+def local_module(cls: type[object]) -> object:
     """A decorator that sets property `__local__` on a module class to mark it for local target only"""
     cls.__local__ = True
     return cls
@@ -305,22 +310,25 @@ class NTFS(Module):
 
     @classmethod
     def _run(cls, target: Target, cli_args: argparse.Namespace, collector: Collector) -> None:
-        for fs, name, mountpoints in iter_ntfs_filesystems(target):
-            log.info("Acquiring %s (%s)", fs, mountpoints)
+        for fs, main_mountpoint, name, mountpoints in iter_ntfs_filesystems(target):
+            log.info("Acquiring from %s as %s (%s)", fs, name, mountpoints)
 
-            collector.collect_file(fs.path("$MFT"), outpath=name + "/$MFT")
-            collector.collect_file(fs.path("$Boot"), outpath=name + "/$Boot")
+            for filename in ("$MFT", "$Boot", "$Secure:$SDS"):
+                if main_mountpoint is not None:
+                    path = fsutil.join(main_mountpoint, filename)
+                    collector.collect_path(path)
+
+                else:
+                    # In case the NTFS filesystem is not mounted, which should not occur but
+                    # iter_ntfs_filesystems allows for the possibility, we fall back to raw file
+                    # collection.
+                    collector.collect_file_raw(filename, fs, name)
 
             cls.collect_usnjrnl(collector, fs, name)
-            cls.collect_ntfs_secure(collector, fs, name)
 
     @classmethod
     def collect_usnjrnl(cls, collector: Collector, fs: Filesystem, name: str) -> None:
-        try:
-            usnjrnl_path = fs.path("$Extend/$Usnjrnl:$J")
-            entry = usnjrnl_path.get()
-            journal = entry.open()
-
+        def usnjrnl_accessor(journal: BinaryIO) -> tuple[BinaryIO, int]:
             # If the filesystem is a virtual NTFS filesystem, journal will be
             # plain BinaryIO, not a RunlistStream.
             if isinstance(journal, RunlistStream):
@@ -328,57 +336,18 @@ class NTFS(Module):
                 while journal.runlist[i][0] is None:
                     journal.seek(journal.runlist[i][1] * journal.block_size, io.SEEK_CUR)
                     i += 1
+                size = journal.size - journal.tell()
+            else:
+                size = journal.size
 
-            # Use the same method to construct the output path as is used in
-            # collector.collect_file()
-            outpath = collector._output_path(f"{name}/$Extend/$Usnjrnl:$J")
+            return (journal, size)
 
-            collector.output.write(
-                outpath,
-                journal,
-                size=journal.size - journal.tell(),
-                entry=entry,
-            )
-            collector.report.add_file_collected(cls.__name__, usnjrnl_path)
-            result = "OK"
-        except exceptions.FileNotFoundError:
-            collector.report.add_file_missing(cls.__name__, usnjrnl_path)
-            result = "File not found"
-        except Exception as err:
-            log.debug("Failed to acquire UsnJrnl", exc_info=True)
-            collector.report.add_file_failed(cls.__name__, usnjrnl_path)
-            result = repr(err)
-
-        log.info("- Collecting file $Extend/$Usnjrnl:$J: %s", result)
-
-    @classmethod
-    def collect_ntfs_secure(cls, collector: Collector, fs: Filesystem, name: str) -> None:
-        try:
-            secure_path = fs.path("$Secure:$SDS")
-            entry = secure_path.get()
-            sds = entry.open()
-
-            # Use the same method to construct the output path as is used in
-            # collector.collect_file()
-            outpath = collector._output_path(f"{name}/$Secure:$SDS")
-
-            collector.output.write(
-                outpath,
-                sds,
-                size=sds.size,
-                entry=entry,
-            )
-            collector.report.add_file_collected(cls.__name__, secure_path)
-            result = "OK"
-        except FileNotFoundError:
-            collector.report.add_file_missing(cls.__name__, secure_path)
-            result = "File not found"
-        except Exception as err:
-            log.debug("Failed to acquire SDS", exc_info=True)
-            collector.report.add_file_failed(cls.__name__, secure_path)
-            result = repr(err)
-
-        log.info("- Collecting file $Secure:$SDS: %s", result)
+        collector.collect_file_raw(
+            "$Extend/$Usnjrnl:$J",
+            fs,
+            name,
+            file_accessor=usnjrnl_accessor,
+        )
 
 
 @register_module("-r", "--registry")
@@ -414,6 +383,27 @@ class Netstat(Module):
         ("command", (["powershell.exe", "netstat", "-a", "-n", "-o"], "netstat")),
     ]
     EXEC_ORDER = ExecutionOrder.BOTTOM
+
+
+@register_module("--devices")
+@local_module
+class Devices(Module):
+    DESC = "devices output"
+    EXEC_ORDER = ExecutionOrder.BOTTOM
+
+    @classmethod
+    def _run(cls, target: Target, cli_args: argparse.Namespace, collector: Collector) -> None:
+        try:
+            lines = _windows_get_devices()
+            collector.output.write_bytes("QueryDosDeviceA.txt", "\n".join(lines).encode("utf-8"))
+            collector.report.add_command_collected(cls.__name__, ["QueryDosDeviceA"])
+        except Exception:
+            collector.report.add_command_failed(cls.__name__, ["QueryDosDeviceA"])
+            log.error(
+                "- Failed to collect output from command `QueryDosDeviceA`",
+                exc_info=True,
+            )
+        return
 
 
 @register_module("--win-processes")
@@ -693,15 +683,13 @@ def recyclebin_filter(path: fsutil.TargetPath) -> bool:
 @register_module("--recyclebin")
 @module_arg(
     "--large-files",
-    action="store_true",
+    action=argparse.BooleanOptionalAction,
     help="Collect files larger than 10MB in the Recycle Bin",
-    default=False,
 )
 @module_arg(
-    "--no-data-files",
-    action="store_true",
-    help="Skip collection of data files in the Recycle Bin",
-    default=False,
+    "--data-files",
+    action=argparse.BooleanOptionalAction,
+    help="Collect the data files in the Recycle Bin",
 )
 class RecycleBin(Module):
     DESC = "recycle bin metadata and data files"
@@ -715,17 +703,24 @@ class RecycleBin(Module):
 
         patterns = ["$Recycle.bin/*/$I*", "Recycler/*/INFO2", "Recycled/INFO2"]
 
-        if not cli_args.no_data_files:
+        if cli_args.data_files is None or cli_args.data_files:
             patterns.extend(["$Recycle.Bin/$R*", "$Recycle.Bin/*/$R*", "RECYCLE*/D*"])
 
         with collector.file_filter(large_files_filter):
-            for fs, name, mountpoints in iter_ntfs_filesystems(target):
-                log.info("Acquiring recycle bin from %s (%s)", fs, mountpoints)
+            for fs, main_mountpoint, name, mountpoints in iter_ntfs_filesystems(target):
+                log.info("Acquiring recycle bin from %s as %s (%s)", fs, name, mountpoints)
 
                 for pattern in patterns:
-                    for entry in fs.path().glob(pattern):
-                        if entry.is_file():
-                            collector.collect_file(entry, outpath=fsutil.join(name, str(entry)))
+                    if main_mountpoint is not None:
+                        pattern = fsutil.join(main_mountpoint, pattern)
+                        collector.collect_glob(pattern)
+                    else:
+                        # In case the NTFS filesystem is not mounted, which should not occur but
+                        # iter_ntfs_filesystems allows for the possibility, we fall back to raw file
+                        # collection.
+                        for entry in fs.path().glob(pattern):
+                            if entry.is_file():
+                                collector.collect_file_raw(fs, entry, name)
 
 
 @register_module("--drivers")
@@ -921,6 +916,16 @@ class ThumbnailCache(Module):
     ]
 
 
+@register_module("--text-editor")
+class TextEditor(Module):
+    DESC = "text editor (un)saved tab contents"
+    # Only Windows 11 notepad & Notepad++ tabs for now, but locations for other text editors may be added later.
+    SPEC = [
+        ("dir", "AppData/Local/Packages/Microsoft.WindowsNotepad_8wekyb3d8bbwe/LocalState/TabState/", from_user_home),
+        ("dir", "AppData/Roaming/Notepad++/backup/", from_user_home),
+    ]
+
+
 @register_module("--misc")
 class Misc(Module):
     DESC = "miscellaneous Windows artefacts"
@@ -940,7 +945,11 @@ class Misc(Module):
         ("glob", "sysvol/ProgramData/USOShared/Logs/System/*.etl"),
         ("glob", "sysvol/Windows/Logs/WindowsUpdate/WindowsUpdate*.etl"),
         ("glob", "sysvol/Windows/Logs/CBS/CBS*.log"),
+        # Windows Search DB
         ("dir", "sysvol/ProgramData/Microsoft/Search/Data/Applications/Windows"),
+        # Windows Search DB - Windows Search Database Roaming
+        ("glob", "AppData/Roaming/Microsoft/Search/Data/Applications/S-1-*/*", from_user_home),
+        ("dir", "sysvol/Windows/SoftwareDistribution/DataStore"),
     ]
 
 
@@ -1004,8 +1013,20 @@ class AV(Module):
         ("dir", "sysvol/ProgramData/McAfee/Endpoint Security/Logs"),
         ("dir", "sysvol/ProgramData/McAfee/Endpoint Security/Logs_Old"),
         ("dir", "sysvol/ProgramData/Mcafee/VirusScan"),
-        ("dir", "sysvol/ProgramData/McAfee/Endpoint Security/Logs"),
         ("dir", "sysvol/ProgramData/McAfee/MSC/Logs"),
+        ("dir", "sysvol/ProgramData/McAfee/Agent/AgentEvents"),
+        ("dir", "sysvol/ProgramData/McAfee/Agent/logs"),
+        ("dir", "sysvol/ProgramData/McAfee/datreputation/Logs"),
+        ("dir", "sysvol/ProgramData/Mcafee/Managed/VirusScan/Logs"),
+        ("dir", "sysvol/Documents and Settings/All Users/Application Data/McAfee/Common Framework/AgentEvents"),
+        ("dir", "sysvol/Documents and Settings/All Users/Application Data/McAfee/MCLOGS/SAE"),
+        ("dir", "sysvol/Documents and Settings/All Users/Application Data/McAfee/datreputation/Logs"),
+        ("dir", "sysvol/Documents and Settings/All Users/Application Data/McAfee/Managed/VirusScan/Logs"),
+        ("dir", "sysvol/Program Files (x86)/McAfee/DLP/WCF Service/Log"),
+        ("dir", "sysvol/Program Files (x86)/McAfee/ePolicy Orchestrator/Apache2/Logs"),
+        ("dir", "sysvol/Program Files (x86)/McAfee/ePolicy Orchestrator/DB/Events"),
+        ("dir", "sysvol/Program Files (x86)/McAfee/ePolicy Orchestrator/DB/Events/Debug"),
+        ("dir", "sysvol/Program Files (x86)/McAfee/ePolicy Orchestrator/Server/Logs"),
         # RogueKiller
         ("glob", "sysvol/ProgramData/RogueKiller/logs/AdliceReport_*.json"),
         # SUPERAntiSpyware
@@ -1077,284 +1098,98 @@ class QuarantinedFiles(Module):
     ]
 
 
+@register_module("--edr")
+class EDR(Module):
+    DESC = "various Endpoint Detection and Response (EDR) logs"
+    SPEC = [
+        # Carbon Black
+        ("dir", "sysvol/ProgramData/CarbonBlack/Logs"),
+    ]
+
+
 @register_module("--history")
 class History(Module):
     DESC = "browser history from IE, Edge, Firefox, and Chrome"
+    DIR_COMBINATIONS = namedtuple("DirCombinations", ["root_dirs", "dir_extensions", "history_files"])
+    COMMON_DIR_COMBINATIONS = [
+        DIR_COMBINATIONS(
+            [
+                # Chromium - RHEL/Ubuntu - DNF/apt
+                ".config/chromium",
+                # Chrome - RHEL/Ubuntu - DNF
+                ".config/google-chrome",
+                # Edge - RHEL/Ubuntu - DNF/apt
+                ".config/microsoft-edge",
+                # Chrome - RHEL/Ubuntu - Flatpak
+                ".var/app/com.google.Chrome/config/google-chrome",
+                # Edge - RHEL/Ubuntu - Flatpak
+                ".var/app/com.microsoft.Edge/config/microsoft-edge",
+                # Chromium - RHEL/Ubuntu - Flatpak
+                ".var/app/org.chromium.Chromium/config/chromium",
+                # Chrome
+                "AppData/Local/Google/Chrom*/User Data",
+                # Edge
+                "AppData/Local/Microsoft/Edge/User Data",
+                "Library/Application Support/Microsoft Edge",
+                "Local Settings/Application Data/Microsoft/Edge/User Data",
+                # Chrome - Legacy
+                "Library/Application Support/Chromium",
+                "Library/Application Support/Google/Chrome",
+                "Local Settings/Application Data/Google/Chrom*/User Data",
+                # Chromium - RHEL/Ubuntu - snap
+                "snap/chromium/common/chromium",
+                # Brave - Windows
+                "AppData/Local/BraveSoftware/Brave-Browser/User Data",
+                "AppData/Roaming/BraveSoftware/Brave-Browser/User Data",
+                # Brave - Linux
+                ".config/BraveSoftware",
+                # Brave - MacOS
+                "Library/Application Support/BraveSoftware",
+            ],
+            ["*", "Snapshots/*/*"],
+            [
+                "Archived History",
+                "Bookmarks",
+                "Cookies*",
+                "Network",
+                "Current Session",
+                "Current Tabs",
+                "Extension Cookies",
+                "Favicons",
+                "History",
+                "Last Session",
+                "Last Tabs",
+                "Login Data",
+                "Login Data For Account",
+                "Media History",
+                "Shortcuts",
+                "Snapshots",
+                "Top Sites",
+                "Web Data",
+            ],
+        ),
+    ]
 
     SPEC = [
         # IE
+        ("dir", "AppData/Local/Microsoft/Internet Explorer/Recovery", from_user_home),
+        ("dir", "AppData/Local/Microsoft/Windows/INetCookies", from_user_home),
+        ("glob", "AppData/Local/Microsoft/Windows/WebCache/*.dat", from_user_home),
+        # IE - index.dat
         ("file", "Cookies/index.dat", from_user_home),
         ("file", "Local Settings/History/History.IE5/index.dat", from_user_home),
         ("glob", "Local Settings/History/History.IE5/MSHist*/index.dat", from_user_home),
         ("file", "Local Settings/Temporary Internet Files/Content.IE5/index.dat", from_user_home),
         ("file", "Local Settings/Application Data/Microsoft/Feeds Cache/index.dat", from_user_home),
-        ("dir", "AppData/Local/Microsoft/Internet Explorer/Recovery", from_user_home),
         ("file", "AppData/Local/Microsoft/Windows/History/History.IE5/index.dat", from_user_home),
-        (
-            "glob",
-            "AppData/Local/Microsoft/Windows/History/History.IE5/MSHist*/index.dat",
-            from_user_home,
-        ),
-        (
-            "file",
-            "AppData/Local/Microsoft/Windows/History/Low/History.IE5/index.dat",
-            from_user_home,
-        ),
-        (
-            "glob",
-            "AppData/Local/Microsoft/Windows/History/Low/History.IE5/MSHist*/index.dat",
-            from_user_home,
-        ),
-        ("dir", "AppData/Local/Microsoft/Windows/INetCookies", from_user_home),
-        (
-            "file",
-            "AppData/Local/Microsoft/Windows/Temporary Internet Files/Content.IE5/index.dat",
-            from_user_home,
-        ),
-        (
-            "file",
-            "AppData/Local/Microsoft/Windows/Temporary Internet Files/Low/Content.IE5/index.dat",
-            from_user_home,
-        ),
-        ("glob", "AppData/Local/Microsoft/Windows/WebCache/*.dat", from_user_home),
+        ("glob", "AppData/Local/Microsoft/Windows/History/History.IE5/MSHist*/index.dat", from_user_home),
+        ("file", "AppData/Local/Microsoft/Windows/History/Low/History.IE5/index.dat", from_user_home),
+        ("glob", "AppData/Local/Microsoft/Windows/History/Low/History.IE5/MSHist*/index.dat", from_user_home),
+        ("file", "AppData/Local/Microsoft/Windows/Temporary Internet Files/Content.IE5/index.dat", from_user_home),
+        ("file", "AppData/Local/Microsoft/Windows/Temporary Internet Files/Low/Content.IE5/index.dat", from_user_home),
         ("file", "AppData/Roaming/Microsoft/Windows/Cookies/index.dat", from_user_home),
         ("file", "AppData/Roaming/Microsoft/Windows/Cookies/Low/index.dat", from_user_home),
         ("file", "AppData/Roaming/Microsoft/Windows/IEDownloadHistory/index.dat", from_user_home),
-        # Chrome
-        ("glob", "AppData/Local/Google/Chrom*/User Data/*/Bookmarks", from_user_home),
-        ("glob", "AppData/Local/Google/Chrom*/User Data/*/Favicons", from_user_home),
-        ("glob", "AppData/Local/Google/Chrom*/User Data/*/History", from_user_home),
-        ("glob", "AppData/Local/Google/Chrom*/User Data/*/Login Data", from_user_home),
-        ("glob", "AppData/Local/Google/Chrom*/User Data/*/Login Data For Account", from_user_home),
-        ("glob", "AppData/Local/Google/Chrom*/User Data/*/Shortcuts", from_user_home),
-        ("glob", "AppData/Local/Google/Chrom*/User Data/*/Top Sites", from_user_home),
-        ("glob", "AppData/Local/Google/Chrom*/User Data/*/Web Data", from_user_home),
-        # Chrome - Legacy
-        ("glob", "AppData/Local/Google/Chrom*/User Data/*/Current Session", from_user_home),
-        ("glob", "AppData/Local/Google/Chrom*/User Data/*/Current Tabs", from_user_home),
-        ("glob", "AppData/Local/Google/Chrom*/User Data/*/Archived History", from_user_home),
-        ("glob", "AppData/Local/Google/Chrom*/User Data/*/Last Session", from_user_home),
-        ("glob", "AppData/Local/Google/Chrom*/User Data/*/Last Tabs", from_user_home),
-        (
-            "glob",
-            "Local Settings/Application Data/Google/Chrom*/User Data/*/Bookmarks",
-            from_user_home,
-        ),
-        (
-            "glob",
-            "Local Settings/Application Data/Google/Chrom*/User Data/*/Favicons",
-            from_user_home,
-        ),
-        (
-            "glob",
-            "Local Settings/Application Data/Google/Chrom*/User Data/*/History",
-            from_user_home,
-        ),
-        (
-            "glob",
-            "Local Settings/Application Data/Google/Chrom*/User Data/*/Login Data",
-            from_user_home,
-        ),
-        (
-            "glob",
-            "Local Settings/Application Data/Google/Chrom*/User Data/*/Login Data For Account",
-            from_user_home,
-        ),
-        (
-            "glob",
-            "Local Settings/Application Data/Google/Chrom*/User Data/*/Shortcuts",
-            from_user_home,
-        ),
-        (
-            "glob",
-            "Local Settings/Application Data/Google/Chrom*/User Data/*/Top Sites",
-            from_user_home,
-        ),
-        (
-            "glob",
-            "Local Settings/Application Data/Google/Chrom*/User Data/*/Web Data",
-            from_user_home,
-        ),
-        # Chrome - Legacy
-        (
-            "glob",
-            "Local Settings/Application Data/Google/Chrom*/User Data/*/Current Session",
-            from_user_home,
-        ),
-        (
-            "glob",
-            "Local Settings/Application Data/Google/Chrom*/User Data/*/Current Tabs",
-            from_user_home,
-        ),
-        (
-            "glob",
-            "Local Settings/Application Data/Google/Chrom*/User Data/*/Archived History",
-            from_user_home,
-        ),
-        (
-            "glob",
-            "Local Settings/Application Data/Google/Chrom*/User Data/*/Last Session",
-            from_user_home,
-        ),
-        (
-            "glob",
-            "Local Settings/Application Data/Google/Chrom*/User Data/*/Last Tabs",
-            from_user_home,
-        ),
-        ("glob", "Library/Application Support/Google/Chrome/*/Bookmarks", from_user_home),
-        ("glob", "Library/Application Support/Google/Chrome/*/Favicons", from_user_home),
-        ("glob", "Library/Application Support/Google/Chrome/*/History", from_user_home),
-        ("glob", "Library/Application Support/Google/Chrome/*/Login Data", from_user_home),
-        ("glob", "Library/Application Support/Google/Chrome/*/Login Data For Account", from_user_home),
-        ("glob", "Library/Application Support/Google/Chrome/*/Shortcuts", from_user_home),
-        ("glob", "Library/Application Support/Google/Chrome/*/Top Sites", from_user_home),
-        ("glob", "Library/Application Support/Google/Chrome/*/Web Data", from_user_home),
-        ("glob", "Library/Application Support/Chromium/*/Bookmarks", from_user_home),
-        ("glob", "Library/Application Support/Chromium/*/Favicons", from_user_home),
-        ("glob", "Library/Application Support/Chromium/*/History", from_user_home),
-        ("glob", "Library/Application Support/Chromium/*/Login Data", from_user_home),
-        ("glob", "Library/Application Support/Chromium/*/Login Data For Account", from_user_home),
-        ("glob", "Library/Application Support/Chromium/*/Shortcuts", from_user_home),
-        ("glob", "Library/Application Support/Chromium/*/Top Sites", from_user_home),
-        ("glob", "Library/Application Support/Chromium/*/Web Data", from_user_home),
-        # Chrome - Legacy
-        ("glob", "Library/Application Support/Google/Chrome/*/Current Session", from_user_home),
-        ("glob", "Library/Application Support/Google/Chrome/*/Current Tabs", from_user_home),
-        ("glob", "Library/Application Support/Google/Chrome/*/Archived History", from_user_home),
-        ("glob", "Library/Application Support/Google/Chrome/*/Last Session", from_user_home),
-        ("glob", "Library/Application Support/Google/Chrome/*/Last Tabs", from_user_home),
-        ("glob", "Library/Application Support/Chromium/*/Current Session", from_user_home),
-        ("glob", "Library/Application Support/Chromium/*/Current Tabs", from_user_home),
-        ("glob", "Library/Application Support/Chromium/*/Archived History", from_user_home),
-        ("glob", "Library/Application Support/Chromium/*/Last Session", from_user_home),
-        ("glob", "Library/Application Support/Chromium/*/Last Tabs", from_user_home),
-        # Chrome - RHEL/Ubuntu - DNF
-        ("glob", ".config/google-chrome/*/Bookmarks", from_user_home),
-        ("glob", ".config/google-chrome/*/Favicons", from_user_home),
-        ("glob", ".config/google-chrome/*/History", from_user_home),
-        ("glob", ".config/google-chrome/*/Login Data", from_user_home),
-        ("glob", ".config/google-chrome/*/Login Data For Account", from_user_home),
-        ("glob", ".config/google-chrome/*/Shortcuts", from_user_home),
-        ("glob", ".config/google-chrome/*/Top Sites", from_user_home),
-        ("glob", ".config/google-chrome/*/Web Data", from_user_home),
-        # Chrome - RHEL/Ubuntu - Flatpak
-        ("glob", ".var/app/com.google.Chrome/config/google-chrome/*/Bookmarks", from_user_home),
-        ("glob", ".var/app/com.google.Chrome/config/google-chrome/*/Favicons", from_user_home),
-        ("glob", ".var/app/com.google.Chrome/config/google-chrome/*/History", from_user_home),
-        ("glob", ".var/app/com.google.Chrome/config/google-chrome/*/Login Data", from_user_home),
-        ("glob", ".var/app/com.google.Chrome/config/google-chrome/*/Login Data For Account", from_user_home),
-        ("glob", ".var/app/com.google.Chrome/config/google-chrome/*/Shortcuts", from_user_home),
-        ("glob", ".var/app/com.google.Chrome/config/google-chrome/*/Top Sites", from_user_home),
-        ("glob", ".var/app/com.google.Chrome/config/google-chrome/*/Web Data", from_user_home),
-        # Chromium - RHEL/Ubuntu - DNF/apt
-        ("glob", ".config/chromium/*/Bookmarks", from_user_home),
-        ("glob", ".config/chromium/*/Favicons", from_user_home),
-        ("glob", ".config/chromium/*/History", from_user_home),
-        ("glob", ".config/chromium/*/Login Data", from_user_home),
-        ("glob", ".config/chromium/*/Login Data For Account", from_user_home),
-        ("glob", ".config/chromium/*/Shortcuts", from_user_home),
-        ("glob", ".config/chromium/*/Top Sites", from_user_home),
-        ("glob", ".config/chromium/*/Web Data", from_user_home),
-        # Chromium - RHEL/Ubuntu - Flatpak
-        ("glob", ".var/app/org.chromium.Chromium/config/chromium/*/Bookmarks", from_user_home),
-        ("glob", ".var/app/org.chromium.Chromium/config/chromium/*/Favicons", from_user_home),
-        ("glob", ".var/app/org.chromium.Chromium/config/chromium/*/History", from_user_home),
-        ("glob", ".var/app/org.chromium.Chromium/config/chromium/*/Login Data", from_user_home),
-        ("glob", ".var/app/org.chromium.Chromium/config/chromium/*/Login Data For Account", from_user_home),
-        ("glob", ".var/app/org.chromium.Chromium/config/chromium/*/Shortcuts", from_user_home),
-        ("glob", ".var/app/org.chromium.Chromium/config/chromium/*/Top Sites", from_user_home),
-        ("glob", ".var/app/org.chromium.Chromium/config/chromium/*/Web Data", from_user_home),
-        # Chromium - RHEL/Ubuntu - snap
-        ("glob", "snap/chromium/common/chromium/*/Bookmarks", from_user_home),
-        ("glob", "snap/chromium/common/chromium/*/Favicons", from_user_home),
-        ("glob", "snap/chromium/common/chromium/*/History", from_user_home),
-        ("glob", "snap/chromium/common/chromium/*/Login Data", from_user_home),
-        ("glob", "snap/chromium/common/chromium/*/Login Data For Account", from_user_home),
-        ("glob", "snap/chromium/common/chromium/*/Shortcuts", from_user_home),
-        ("glob", "snap/chromium/common/chromium/*/Top Sites", from_user_home),
-        ("glob", "snap/chromium/common/chromium/*/Web Data", from_user_home),
-        # Edge
-        ("glob", "AppData/Local/Microsoft/Edge/User Data/*/Bookmarks", from_user_home),
-        ("glob", "AppData/Local/Microsoft/Edge/User Data/*/Extension Cookies", from_user_home),
-        ("glob", "AppData/Local/Microsoft/Edge/User Data/*/Favicons", from_user_home),
-        ("glob", "AppData/Local/Microsoft/Edge/User Data/*/History", from_user_home),
-        ("glob", "AppData/Local/Microsoft/Edge/User Data/*/Login Data", from_user_home),
-        ("glob", "AppData/Local/Microsoft/Edge/User Data/*/Media History", from_user_home),
-        ("glob", "AppData/Local/Microsoft/Edge/User Data/*/Shortcuts", from_user_home),
-        ("glob", "AppData/Local/Microsoft/Edge/User Data/*/Top Sites", from_user_home),
-        ("glob", "AppData/Local/Microsoft/Edge/User Data/*/Web Data", from_user_home),
-        (
-            "glob",
-            "Local Settings/Application Data/Microsoft/Edge/User Data/*/Bookmarks",
-            from_user_home,
-        ),
-        (
-            "glob",
-            "Local Settings/Application Data/Microsoft/Edge/User Data/*/Extension Cookies",
-            from_user_home,
-        ),
-        (
-            "glob",
-            "Local Settings/Application Data/Microsoft/Edge/User Data/*/Favicons",
-            from_user_home,
-        ),
-        (
-            "glob",
-            "Local Settings/Application Data/Microsoft/Edge/User Data/*/History",
-            from_user_home,
-        ),
-        (
-            "glob",
-            "Local Settings/Application Data/Microsoft/Edge/User Data/*/Login Data",
-            from_user_home,
-        ),
-        (
-            "glob",
-            "Local Settings/Application Data/Microsoft/Edge/User Data/*/Media History",
-            from_user_home,
-        ),
-        (
-            "glob",
-            "Local Settings/Application Data/Microsoft/Edge/User Data/*/Shortcuts",
-            from_user_home,
-        ),
-        (
-            "glob",
-            "Local Settings/Application Data/Microsoft/Edge/User Data/*/Top Sites",
-            from_user_home,
-        ),
-        (
-            "glob",
-            "Local Settings/Application Data/Microsoft/Edge/User Data/*/Web Data",
-            from_user_home,
-        ),
-        ("glob", "Library/Application Support/Microsoft Edge/*/Bookmarks", from_user_home),
-        ("glob", "Library/Application Support/Microsoft Edge/*/Extension Cookies", from_user_home),
-        ("glob", "Library/Application Support/Microsoft Edge/*/Favicons", from_user_home),
-        ("glob", "Library/Application Support/Microsoft Edge/*/History", from_user_home),
-        ("glob", "Library/Application Support/Microsoft Edge/*/Login Data", from_user_home),
-        ("glob", "Library/Application Support/Microsoft Edge/*/Media History", from_user_home),
-        ("glob", "Library/Application Support/Microsoft Edge/*/Shortcuts", from_user_home),
-        ("glob", "Library/Application Support/Microsoft Edge/*/Top Sites", from_user_home),
-        ("glob", "Library/Application Support/Microsoft Edge/*/Web Data", from_user_home),
-        # Edge - RHEL/Ubuntu - DNF/apt
-        ("glob", ".config/microsoft-edge/*/Bookmarks", from_user_home),
-        ("glob", ".config/microsoft-edge/*/Favicons", from_user_home),
-        ("glob", ".config/microsoft-edge/*/History", from_user_home),
-        ("glob", ".config/microsoft-edge/*/Login Data", from_user_home),
-        ("glob", ".config/microsoft-edge/*/Login Data For Account", from_user_home),
-        ("glob", ".config/microsoft-edge/*/Shortcuts", from_user_home),
-        ("glob", ".config/microsoft-edge/*/Top Sites", from_user_home),
-        ("glob", ".config/microsoft-edge/*/Web Data", from_user_home),
-        # Edge - RHEL/Ubuntu - Flatpak
-        ("glob", ".var/app/com.microsoft.Edge/config/microsoft-edge/*/Bookmarks", from_user_home),
-        ("glob", ".var/app/com.microsoft.Edge/config/microsoft-edge/*/Favicons", from_user_home),
-        ("glob", ".var/app/com.microsoft.Edge/config/microsoft-edge/*/History", from_user_home),
-        ("glob", ".var/app/com.microsoft.Edge/config/microsoft-edge/*/Login Data", from_user_home),
-        ("glob", ".var/app/com.microsoft.Edge/config/microsoft-edge/*/Login Data For Account", from_user_home),
-        ("glob", ".var/app/com.microsoft.Edge/config/microsoft-edge/*/Shortcuts", from_user_home),
-        ("glob", ".var/app/com.microsoft.Edge/config/microsoft-edge/*/Top Sites", from_user_home),
-        ("glob", ".var/app/com.microsoft.Edge/config/microsoft-edge/*/Web Data", from_user_home),
         # Firefox - Windows
         ("glob", "AppData/Local/Mozilla/Firefox/Profiles/*/*.sqlite*", from_user_home),
         ("glob", "AppData/Roaming/Mozilla/Firefox/Profiles/*/*.sqlite*", from_user_home),
@@ -1362,11 +1197,11 @@ class History(Module):
         # Firefox - macOS
         ("glob", "/Users/*/Library/Application Support/Firefox/Profiles/*/*.sqlite*"),
         # Firefox - RHEL/Ubuntu - Flatpak
-        ("glob", ".var/app/org.mozilla.firefox/.mozilla/firefox/*/*.sqlite", from_user_home),
+        ("glob", ".var/app/org.mozilla.firefox/.mozilla/firefox/*/*.sqlite*", from_user_home),
         # Firefox - RHEL/Ubuntu - DNF/apt
-        ("glob", ".mozilla/firefox/*/*.sqlite", from_user_home),
+        ("glob", ".mozilla/firefox/*/*.sqlite*", from_user_home),
         # Firefox - RHEL/Ubuntu - snap
-        ("glob", "snap/firefox/common/.mozilla/firefox/*/*.sqlite", from_user_home),
+        ("glob", "snap/firefox/common/.mozilla/firefox/*/*.sqlite*", from_user_home),
         # Safari - macOS
         ("file", "Library/Safari/Bookmarks.plist", from_user_home),
         ("file", "Library/Safari/Downloads.plist", from_user_home),
@@ -1376,6 +1211,18 @@ class History(Module):
         ("file", "Library/Caches/com.apple.Safari/Cache.db", from_user_home),
     ]
 
+    @classmethod
+    def get_spec_additions(cls, target: Target, cli_args: argparse.Namespace) -> Iterator[tuple]:
+        spec = set()
+        for root_dirs, extension_dirs, history_files in cls.COMMON_DIR_COMBINATIONS:
+            for root_dir, extension_dir, history_file in product(root_dirs, extension_dirs, history_files):
+                full_path = f"{root_dir}/{extension_dir}/{history_file}"
+                search_type = "glob" if "*" in full_path else "file"
+
+                spec.add((search_type, full_path, from_user_home))
+
+        return spec
+
 
 @register_module("--remoteaccess")
 class RemoteAccess(Module):
@@ -1384,10 +1231,16 @@ class RemoteAccess(Module):
         # teamviewer
         ("glob", "sysvol/Program Files/TeamViewer/*.log"),
         ("glob", "sysvol/Program Files (x86)/TeamViewer/*.log"),
+        ("glob", "/var/log/teamviewer*/*.log"),
         ("glob", "AppData/Roaming/TeamViewer/*.log", from_user_home),
-        # anydesk
+        ("glob", "Library/Logs/TeamViewer/*.log", from_user_home),
+        # anydesk - Windows
         ("dir", "sysvol/ProgramData/AnyDesk"),
         ("glob", "AppData/Roaming/AnyDesk/*.trace", from_user_home),
+        ("glob", "AppData/Roaming/AnyDesk/*/*.trace", from_user_home),
+        # anydesk - Mac + Linux
+        ("glob", ".anydesk*/*.trace", from_user_home),
+        ("file", "/var/log/anydesk.trace"),
         # zoho
         ("dir", "sysvol/ProgramData/ZohoMeeting/log"),
         ("dir", "AppData/Local/ZohoMeeting/log", from_user_home),
@@ -1458,8 +1311,9 @@ class Boot(Module):
 
 
 def private_key_filter(path: fsutil.TargetPath) -> bool:
-    with path.open("rt") as file:
-        return "PRIVATE KEY" in file.readline()
+    if path.is_file() and not path.is_symlink():
+        with path.open("rt") as file:
+            return "PRIVATE KEY" in file.readline()
 
 
 @register_module("--home")
@@ -1500,7 +1354,7 @@ class Home(Module):
 
 
 @register_module("--ssh")
-@module_arg("--private-keys", action="store_true", help="Add any private keys", default=False)
+@module_arg("--private-keys", action=argparse.BooleanOptionalAction, help="Add any private keys")
 class SSH(Module):
     SPEC = [
         ("glob", ".ssh/*", from_user_home),
@@ -1519,6 +1373,26 @@ class SSH(Module):
 
         with collector.file_filter(filter):
             super().run(target, cli_args, collector)
+
+
+@register_module("--docker")
+class Docker(Module):
+    DESC = "various Docker logs and configuration files"
+    SPEC = [
+        # Container log files
+        ("glob", "/var/lib/docker/containers/*/*-json.log"),
+        ("glob", "/var/lib/docker/containers/*/*.json"),
+        ("glob", "/var/lib/docker/containers/*/hostname"),
+        # Linux daemon configs
+        ("file", "/etc/docker/daemon.json"),
+        ("file", "/var/snap/docker/current/config/daemon.json"),
+        # Windows daemon configs
+        ("file", "sysvol/ProgramData/docker/config/daemon.json"),
+        # User-specific config files (MacOS/Linux/Windows)
+        ("file", ".docker/daemon.json", from_user_home),
+        # Repositories
+        ("file", "/var/lib/docker/image/overlay2/repositories.json"),
+    ]
 
 
 @register_module("--var")
@@ -1605,21 +1479,24 @@ class Bootbanks(Module):
             "bootbank": "BOOTBANK1",
             "altbootbank": "BOOTBANK2",
         }
-        boot_fs = []
+        boot_fs = {}
 
         for boot_dir, boot_vol in boot_dirs.items():
             dir_path = target.fs.path(boot_dir)
             if dir_path.is_symlink() and dir_path.exists():
                 dst = dir_path.readlink()
-                boot_fs.append((dst.name, boot_vol, dst.get().top.fs))
+                fs = dst.get().top.fs
+                boot_fs[fs] = boot_vol
 
-        for uuid, name, fs in boot_fs:
-            log.info("Acquiring /vmfs/volumes/%s (%s)", uuid, name)
-            base = f"fs/{uuid}:{name}"
-            for path in fs.path("/").rglob("*"):
-                if not path.is_file():
-                    continue
-                collector.collect_file(path, outpath=path, base=base)
+        for fs, mountpoint, uuid, _ in iter_esxi_filesystems(target):
+            if fs in boot_fs:
+                name = boot_fs[fs]
+                log.info("Acquiring %s (%s)", mountpoint, name)
+                mountpoint_len = len(mountpoint)
+                base = f"fs/{uuid}:{name}"
+                for path in target.fs.path(mountpoint).rglob("*"):
+                    outpath = path.as_posix()[mountpoint_len:]
+                    collector.collect_path(path, outpath=outpath, base=base)
 
 
 @register_module("--esxi")
@@ -1642,16 +1519,16 @@ class VMFS(Module):
 
     @classmethod
     def _run(cls, target: Target, cli_args: argparse.Namespace, collector: Collector) -> None:
-        for uuid, name, fs in iter_esxi_filesystems(target):
+        for fs, mountpoint, uuid, name in iter_esxi_filesystems(target):
             if not fs.__type__ == "vmfs":
                 continue
 
-            log.info("Acquiring /vmfs/volumes/%s (%s)", uuid, name)
+            log.info("Acquiring %s (%s)", mountpoint, name)
+            mountpoint_len = len(mountpoint)
             base = f"fs/{uuid}:{name}"
-            for path in fs.path("/").glob("*.sf"):
-                if not path.is_file():
-                    continue
-                collector.collect_file(path, outpath=path, base=base)
+            for path in target.fs.path(mountpoint).glob("*.sf"):
+                outpath = path.as_posix()[mountpoint_len:]
+                collector.collect_path(path, outpath=outpath, base=base)
 
 
 @register_module("--activities-cache")
@@ -1822,61 +1699,26 @@ def print_acquire_warning(target: Target) -> None:
         log.warning("========================================== WARNING ==========================================")
 
 
-def modargs2json(args: argparse.Namespace) -> dict:
-    json_opts = {}
-    for module in MODULES.values():
-        cli_arg = module.__cli_args__[-1:][0][1]
-        if opt := cli_arg.get("dest"):
-            json_opts[opt] = getattr(args, opt)
-    return json_opts
+def _get_modules_for_profile(
+    profile_name: str,
+    operating_system: str,
+    profiles: dict[str, dict[str, list[type[Module]]]],
+    err_msg: str,
+) -> dict[str, type[Module]]:
+    modules_selected = {}
 
-
-def acquire_target(target: Target, *args, **kwargs) -> list[str]:
-    if isinstance(target._loader, TargetdLoader):
-        files = acquire_target_targetd(target, *args, **kwargs)
-    else:
-        files = acquire_target_regular(target, *args, **kwargs)
-    return files
-
-
-def acquire_target_targetd(target: Target, args: argparse.Namespace, output_ts: Optional[str] = None) -> list[str]:
-    files = []
-    # debug logs contain references to flow objects and will give errors
-    logging.getLogger().setLevel(logging.CRITICAL)
-    if not len(target.hostname()):
-        log.error("Unable to initialize targetd.")
-        return files
-    json_opts = modargs2json(args)
-    json_opts["profile"] = args.profile
-    json_opts["file"] = args.file
-    json_opts["directory"] = args.directory
-    json_opts["glob"] = args.glob
-    m = {"targetd-meta": "acquire", "args": json_opts}
-    json_str = json.dumps(m)
-    targetd = target._loader.instance.client
-    targetd.send_message(json_str.encode("utf-8"))
-    targetd.sync()
-    for stream in targetd.streams:
-        files.append(stream.out_file)
-    return files
-
-
-def _add_modules_for_profile(choice: str, operating_system: str, profile: dict, msg: str) -> Optional[dict]:
-    modules_selected = dict()
-
-    if choice and choice != "none":
-        profile_dict = profile[choice]
-        if operating_system not in profile_dict:
-            log.error(msg, operating_system, choice)
-            return None
-
-        for mod in profile_dict[operating_system]:
-            modules_selected[mod.__modname__] = mod
+    if profile_name != "none":
+        if (profile := profiles.get(profile_name, {}).get(operating_system)) is not None:
+            for mod in profile:
+                modules_selected[mod.__modname__] = mod
+        else:
+            log.error(err_msg, operating_system, profile_name)
 
     return modules_selected
 
 
-def acquire_target_regular(target: Target, args: argparse.Namespace, output_ts: Optional[str] = None) -> list[str]:
+def acquire_target(target: Target, args: argparse.Namespace, output_ts: Optional[str] = None) -> list[str | Path]:
+    acquire_gui = GUI()
     files = []
     output_ts = output_ts or get_utc_now_str()
     if args.log_to_dir:
@@ -1890,7 +1732,7 @@ def acquire_target_regular(target: Target, args: argparse.Namespace, output_ts: 
     if log_file:
         files.append(log_file)
         if target.path.name == "local":
-            skip_list.add(normalize_path(target, log_file, resolve=True))
+            skip_list.add(normalize_path(target, log_file, resolve_parents=True, preserve_case=False))
 
     print_disks_overview(target)
     print_volumes_overview(target)
@@ -1939,20 +1781,23 @@ def acquire_target_regular(target: Target, args: argparse.Namespace, output_ts: 
         profile = "default"
         log.info("")
 
-    profile_modules = _add_modules_for_profile(
-        profile, target.os, PROFILES, "No collection set for OS %s with profile %s"
+    normal_modules = _get_modules_for_profile(
+        profile, target.os, PROFILES, "No collection set for OS '%s' with profile '%s'"
     )
-    volatile_modules = _add_modules_for_profile(
-        args.volatile_profile, target.os, VOLATILE, "No collection set for OS %s with volatile profile %s"
+    modules_selected.update(normal_modules)
+
+    if not (volatile_profile := args.volatile_profile):
+        volatile_profile = "none"
+
+    volatile_modules = _get_modules_for_profile(
+        volatile_profile, target.os, VOLATILE, "No collection set for OS '%s' with volatile profile '%s'"
     )
-
-    if (profile_modules or volatile_modules) is None:
-        return files
-
-    modules_selected.update(profile_modules)
     modules_selected.update(volatile_modules)
 
-    log.info("Modules selected: %s", ", ".join(sorted(modules_selected)))
+    if not modules_selected:
+        log.warn("NO modules selected!")
+    else:
+        log.info("Modules selected: %s", ", ".join(sorted(modules_selected)))
 
     local_only_modules = {name: module for name, module in modules_selected.items() if hasattr(module, "__local__")}
     if target.path.name != "local" and local_only_modules:
@@ -1976,9 +1821,9 @@ def acquire_target_regular(target: Target, args: argparse.Namespace, output_ts: 
         log.info("Logging to file %s", log_path)
         files = [log_file_handler.baseFilename]
         if target.path.name == "local":
-            skip_list = {normalize_path(target, log_path, resolve=True)}
+            skip_list = {normalize_path(target, log_path, resolve_parents=True, preserve_case=False)}
 
-    output_path = args.output
+    output_path = args.output or args.output_file
     if output_path.is_dir():
         output_dir = format_output_name(target.name, output_ts)
         output_path = output_path.joinpath(output_dir)
@@ -1987,12 +1832,13 @@ def acquire_target_regular(target: Target, args: argparse.Namespace, output_ts: 
     output = OUTPUTS[args.output_type](
         output_path,
         compress=args.compress,
+        compression_method=args.compress_method,
         encrypt=args.encrypt,
         public_key=args.public_key,
     )
     files.append(output.path)
     if target.path.name == "local":
-        skip_list.add(normalize_path(target, output.path, resolve=True))
+        skip_list.add(normalize_path(target, output.path, resolve_parents=True, preserve_case=False))
 
     log.info("Writing output to %s", output.path)
     if skip_list:
@@ -2027,6 +1873,7 @@ def acquire_target_regular(target: Target, args: argparse.Namespace, output_ts: 
 
         # Run modules (sort first based on execution order)
         modules_selected = sorted(modules_selected.items(), key=lambda module: module[1].EXEC_ORDER)
+        count = 0
         for name, mod in modules_selected:
             try:
                 mod.run(target, args, collector)
@@ -2035,6 +1882,10 @@ def acquire_target_regular(target: Target, args: argparse.Namespace, output_ts: 
             except Exception:
                 log.error("Error while running module %s", name, exc_info=True)
                 modules_failed[mod.__name__] = get_formatted_exception()
+
+            acquire_gui.progress = (acquire_gui.shard // len(modules_selected)) * count
+            count += 1
+
             log.info("")
 
         collection_report = collector.report
@@ -2059,7 +1910,7 @@ def acquire_target_regular(target: Target, args: argparse.Namespace, output_ts: 
             **collection_report_serialized,
         }
 
-        if args.output.is_dir():
+        if args.output:
             report_file_name = format_output_name(target.name, postfix=output_ts, ext="report.json")
         else:
             report_file_name = f"{output_path.name}.report.json"
@@ -2074,15 +1925,18 @@ def acquire_target_regular(target: Target, args: argparse.Namespace, output_ts: 
     return files
 
 
-def upload_files(paths: list[Path], upload_plugin: UploaderPlugin, no_proxy: bool = False) -> None:
+def upload_files(paths: list[str | Path], upload_plugin: UploaderPlugin, no_proxy: bool = False) -> None:
     proxies = None if no_proxy else urllib.request.getproxies()
     log.debug("Proxies: %s (no_proxy = %s)", proxies, no_proxy)
 
+    log.info('Uploading files: "%s"', " ".join(map(str, paths)))
     try:
         upload_files_using_uploader(upload_plugin, paths, proxies)
     except Exception:
-        log.error("Upload %s FAILED. See log file for details.", paths)
-        log.exception("")
+        log.error('Upload FAILED for files: "%s". See log file for details.', " ".join(map(str, paths)))
+        raise
+    else:
+        log.info("Upload succeeded.")
 
 
 class WindowsProfile:
@@ -2122,6 +1976,8 @@ class WindowsProfile:
         WindowsNotifications,
         SSH,
         IIS,
+        TextEditor,
+        Docker,
     ]
 
 
@@ -2136,6 +1992,7 @@ class LinuxProfile:
     DEFAULT = MINIMAL
     FULL = [
         *DEFAULT,
+        Docker,
         History,
         WebHosting,
     ]
@@ -2180,6 +2037,7 @@ class OSXProfile:
         *DEFAULT,
         History,
         SSH,
+        Docker,
     ]
 
 
@@ -2211,6 +2069,7 @@ PROFILES = {
 
 class VolatileProfile:
     DEFAULT = [
+        Devices,
         Netstat,
         WinProcesses,
         WinProcEnv,
@@ -2243,9 +2102,29 @@ VOLATILE = {
 }
 
 
+def exit_success(default_args: list[str]):
+    log.info("Acquire finished successful")
+    log.info("Arguments: %s", " ".join(sys.argv[1:]))
+    log.info("Default Arguments: %s", " ".join(default_args))
+    log.info("Exiting with status code 0 (SUCCESS)")
+    sys.exit(0)
+
+
+def exit_failure(default_args: list[str]):
+    log.error("Acquire FAILED")
+    log.error("Arguments: %s", " ".join(sys.argv[1:]))
+    log.error("Default Arguments: %s", " ".join(default_args))
+    log.error("Exiting with status code 1 (FAILURE)")
+    sys.exit(1)
+
+
 def main() -> None:
     parser = create_argument_parser(PROFILES, VOLATILE, MODULES)
-    args = parse_acquire_args(parser, config=CONFIG)
+    args, rest = parse_acquire_args(parser, config=CONFIG)
+
+    # Since output has a default value, set it to None when output_file is defined
+    if args.output_file:
+        args.output = None
 
     try:
         check_and_set_log_args(args)
@@ -2263,82 +2142,118 @@ def main() -> None:
 
     setup_logging(log, log_file, args.verbose, delay=args.log_delay)
 
-    log.info(ACQUIRE_BANNER)
-    log.info("User: %s | Admin: %s", get_user_name(), is_user_admin())
-    log.info("Arguments: %s", " ".join(sys.argv[1:]))
-    log.info("Default Arguments: %s", " ".join(args.config.get("arguments")))
-    log.info("")
-
-    plugins_to_load = [("cloud", MinIO)]
-    upload_plugins = UploaderRegistry("acquire.plugins", plugins_to_load)
-
+    acquire_successful = True
+    files_to_upload = [log_file]
+    acquire_gui = None
     try:
+        log.info(ACQUIRE_BANNER)
+        log.info("User: %s | Admin: %s", get_user_name(), is_user_admin())
+        log.info("Arguments: %s", " ".join(sys.argv[1:]))
+        log.info("Default Arguments: %s", " ".join(args.config.get("arguments")))
+        log.info("")
+
+        # start GUI if requested through CLI / config
+        flavour = None
+        if args.gui == "always" or (
+            args.gui == "depends" and os.environ.get("PYS_KEYSOURCE") == "prompt" and len(sys.argv) == 1
+        ):
+            flavour = platform.system()
+        acquire_gui = GUI(flavour=flavour, upload_available=args.auto_upload)
+
+        args.output, args.auto_upload, cancel = acquire_gui.wait_for_start(args)
+        if cancel:
+            log.info("Acquire cancelled")
+            exit_success(args.config.get("arguments"))
+        # From here onwards, the GUI will be locked and cannot be closed because we're acquiring
+
+        plugins_to_load = [("cloud", MinIO)]
+        upload_plugins = UploaderRegistry("acquire.plugins", plugins_to_load)
+
         check_and_set_acquire_args(args, upload_plugins)
-    except ValueError as err:
-        log.exception(err)
-        parser.exit(1)
 
-    if args.targetd:
-        from targetd.tools.targetd import start_client
+        if args.upload:
+            try:
+                upload_files(args.upload, args.upload_plugin, args.no_proxy)
+            except Exception as err:
+                acquire_gui.message("Failed to upload files")
+                log.exception(err)
+                exit_failure(args.config.get("arguments"))
+            exit_success(args.config.get("arguments"))
 
-        # set @auto hostname to real hostname
-        if args.targetd_hostname == "@auto":
-            args.targetd_hostname = f"/host/{Target.open('local').hostname}"
+        target_paths = []
+        for target_path in args.targets:
+            target_path = args_to_uri([target_path], args.loader, rest)[0] if args.loader else target_path
+            if target_path == "local":
+                target_query = {}
+                if args.force_fallback:
+                    target_query.update({"force-directory-fs": 1})
 
-        config = {
-            "function": args.targetd_func,
-            "topics": [args.targetd_hostname, args.targetd_groupname, args.targetd_globalname],
-            "link": args.targetd_link,
-            "address": args.targetd_ip,
-            "port": args.targetd_port,
-            "cacert_str": args.targetd_cacert,
-            "service": args.targetd_func == "agent",
-            "cacert": None,
-        }
-        start_client(args, presets=config)
-        return
+                if args.fallback:
+                    target_query.update({"fallback-to-directory-fs": 1})
 
-    if args.upload:
+                target_query = urllib.parse.urlencode(target_query)
+                target_path = f"{target_path}?{target_query}"
+            target_paths.append(target_path)
+
         try:
-            upload_files(args.upload, args.upload_plugin, args.no_proxy)
+            target_name = "Unknown"  # just in case open_all already fails
+            for target in Target.open_all(target_paths):
+                target_name = "Unknown"  # overwrite previous target name
+                target_name = target.name
+                log.info("Loading target %s", target_name)
+                log.info(target)
+                if target.os == "esxi" and target.name == "local":
+                    # Loader found that we are running on an esxi host
+                    # Perform operations to "enhance" memory
+                    with esxi_memory_context_manager():
+                        files_to_upload = acquire_children_and_targets(target, args)
+                else:
+                    files_to_upload = acquire_children_and_targets(target, args)
         except Exception:
-            log.exception("Failed to upload files")
-        return
+            log.error("Failed to acquire target: %s", target_name)
+            if not is_user_admin():
+                log.error("Try re-running as administrator/root")
+                acquire_gui.message("This application must be run as administrator.")
+            raise
 
-    RemoteStreamConnection.configure(args.cagent_key, args.cagent_certificate)
+        files_to_upload = sort_files(files_to_upload)
 
-    target_path = args.target
-
-    if target_path == "local":
-        target_query = {}
-        if args.force_fallback:
-            target_query.update({"force-directory-fs": 1})
-
-        if args.fallback:
-            target_query.update({"fallback-to-directory-fs": 1})
-
-        target_query = urllib.parse.urlencode(target_query)
-        target_path = f"{target_path}?{target_query}"
-
-    log.info("Loading target %s", target_path)
+    except Exception as err:
+        log.error("Acquiring artifacts FAILED")
+        log.exception(err)
+        acquire_successful = False
+    else:
+        log.info("Acquiring artifacts succeeded")
 
     try:
-        target = Target.open(target_path)
-        log.info(target)
-    except Exception:
-        if not is_user_admin():
-            log.error("Failed to load target, try re-running as administrator/root.")
-            parser.exit(1)
-        log.exception("Failed to load target")
-        raise
+        # The auto-upload of files is done at the very very end to make sure any
+        # logged exceptions are written to the log file before uploading.
+        # This means that any failures from this point on will not be part of the
+        # uploaded log files, they will be written to the logfile on disk though.
+        if args.auto_upload and args.upload_plugin and files_to_upload:
+            try:
+                log_file_handler = get_file_handler(log)
+                if log_file_handler:
+                    log_file_handler.close()
 
-    if target.os == "esxi":
-        # Loader found that we are running on an esxi host
-        # Perform operations to "enhance" memory
-        with esxi_memory_context_manager():
-            acquire_children_and_targets(target, args)
+                upload_files(files_to_upload, args.upload_plugin)
+            except Exception:
+                if acquire_gui:
+                    acquire_gui.message("Failed to upload files")
+                raise
+
+        if acquire_gui:
+            acquire_gui.finish()
+            acquire_gui.wait_for_quit()
+
+    except Exception as err:
+        acquire_successful = False
+        log.exception(err)
+
+    if acquire_successful:
+        exit_success(args.config.get("arguments"))
     else:
-        acquire_children_and_targets(target, args)
+        exit_failure(args.config.get("arguments"))
 
 
 def load_child(target: Target, child_path: Path) -> None:
@@ -2354,22 +2269,38 @@ def load_child(target: Target, child_path: Path) -> None:
     return child
 
 
-def acquire_children_and_targets(target: Target, args: argparse.Namespace) -> None:
+def acquire_children_and_targets(target: Target, args: argparse.Namespace) -> list[str | Path]:
     if args.child:
         target = load_child(target, args.child)
 
     log.info("")
 
     files = []
+    acquire_gui = GUI()
+
+    counter = 0
+    progress_limit = 50 if args.auto_upload else 90
+    total_targets = 0
+    if args.children:
+        total_targets += len(list(target.list_children()))
+
     if (args.children and not args.skip_parent) or not args.children:
+        total_targets += 1
+        counter += 1
+        acquire_gui.shard = int((progress_limit / total_targets) * counter)
         try:
             files.extend(acquire_target(target, args, args.start_time))
+
         except Exception:
-            log.exception("Failed to acquire target")
+            log.error("Failed to acquire main target")
+            acquire_gui.message("Failed to acquire target")
+            acquire_gui.wait_for_quit()
             raise
 
     if args.children:
         for child in target.list_children():
+            counter += 1
+            acquire_gui.shard = int((progress_limit / total_targets) * counter)
             try:
                 child_target = load_child(target, child.path)
             except Exception:
@@ -2381,21 +2312,11 @@ def acquire_children_and_targets(target: Target, args: argparse.Namespace) -> No
                 child_files = acquire_target(child_target, args)
                 files.extend(child_files)
             except Exception:
-                log.exception("Failed to acquire child target")
+                log.exception("Failed to acquire child target %s", child_target.name)
+                acquire_gui.message("Failed to acquire child target")
                 continue
 
-    files = sort_files(files)
-
-    if args.auto_upload:
-        log_file_handler = get_file_handler(log)
-        if log_file_handler:
-            log_file_handler.close()
-
-        log.info("")
-        try:
-            upload_files(files, args.upload_plugin)
-        except Exception:
-            log.exception("Failed to upload files")
+    return files
 
 
 def sort_files(files: list[Union[str, Path]]) -> list[Path]:
