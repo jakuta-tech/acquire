@@ -1,8 +1,11 @@
+from __future__ import annotations
+
 import hashlib
 import io
 from datetime import datetime, timezone
+from typing import BinaryIO
 
-from dissect import cstruct
+from dissect.cstruct import cstruct
 
 try:
     from Crypto.Cipher import AES, PKCS1_OAEP
@@ -14,9 +17,7 @@ except ImportError:
     HAS_PYCRYPTODOME = False
 
 
-c_acquire = cstruct.cstruct()
-c_acquire.load(
-    """
+acquire_def = """
 enum HeaderType : uint8 {
     PKCS1_OAEP = 0x1,
 };
@@ -49,8 +50,7 @@ struct footer {
     uint16      length;                 // Digest length (precedes footer)
 };
 """
-)
-
+c_acquire = cstruct().load(acquire_def)
 
 FILE_MAGIC = b"ENCRYPTEDACQUIRE"
 FILE_VERSION = 1
@@ -73,7 +73,7 @@ class EncryptedStream(io.RawIOBase):
         public_key: The RSA public key to encrypt the header with.
     """
 
-    def __init__(self, fh, public_key):
+    def __init__(self, fh: BinaryIO, public_key: str):
         if not HAS_PYCRYPTODOME:
             raise ImportError("PyCryptodome is not available")
 
@@ -105,25 +105,25 @@ class EncryptedStream(io.RawIOBase):
         )
         self.write_header(file_header.dumps() + sealed_header)
 
-    def write_header(self, header):
+    def write_header(self, header: bytes) -> None:
         self.cipher.update(header)
         self.fh.write(header)
 
-    def write(self, b):
+    def write(self, b: bytes) -> int:
         return self.fh.write(self.cipher.encrypt(b))
 
-    def tell(self):
+    def tell(self) -> int:
         return self.fh.tell()
 
-    def seek(self, pos, whence=io.SEEK_CUR):
-        raise TypeError("seeking is not allowed")
+    def seek(self, pos: int, whence: int = io.SEEK_CUR) -> int:
+        raise io.UnsupportedOperation("seeking is not allowed")
 
-    def close(self):
+    def close(self) -> None:
         self.finalize()
         super().close()
         self.fh.close()
 
-    def finalize(self):
+    def finalize(self) -> None:
         digest = self.cipher.digest()
         footer = c_acquire.footer(magic=FOOTER_MAGIC, length=len(digest))
 
@@ -133,7 +133,7 @@ class EncryptedStream(io.RawIOBase):
             self.cipher.clean()
 
 
-def key_fingerprint(pkey):
+def key_fingerprint(pkey: PKCS1_OAEP.PKCS1OAEP_Cipher) -> bytes:
     if isinstance(pkey, PKCS1_OAEP.PKCS1OAEP_Cipher):
         pkey = pkey._key
     der = pkey.export_key("DER")
